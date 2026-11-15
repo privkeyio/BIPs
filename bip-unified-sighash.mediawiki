@@ -1,0 +1,329 @@
+<pre>
+  BIP: ?
+  Layer: Consensus (hard fork)
+  Title: SIGHASH_UNIFIED
+  Authors: Kyle W. Santiago <kyle@privkey.io>
+  Status: Draft
+  Type: Specification
+  Assigned: ?
+  License: BSD-2-Clause
+  Requires: 143, 340, 341, 342
+</pre>
+
+== Abstract ==
+
+This document specifies an opt-in signature-hash algorithm for Bitcoin transactions.
+A signature opts in by setting bit <code>0x20</code> in its hash-type byte.
+From the BLAKE2b activation height, such signatures sign a common message format across bare, P2SH, segwit v0, taproot key-path, and tapscript spends.
+
+For those signatures it removes the quadratic hashing of CVE-2013-2292 and the missing amount commitment of CVE-2020-14199.
+It does not bound worst-case validation cost, since a transaction that does not opt in still hashes quadratically.
+
+== Copyright ==
+
+This document is licensed under the 2-clause BSD license.
+
+== Motivation ==
+
+Bitcoin has three signature hash algorithms in use.
+The original one covers bare, P2PKH, and P2SH inputs, BIP 143 covers segwit v0, and BIP 341 covers taproot.
+The first two have known defects that BIP 341 does not have, and that were never fixed for the inputs that predate it.
+
+'''Quadratic hashing (CVE-2013-2292).'''
+The original algorithm reserializes the whole transaction for every input, so the cost of hashing for an n-input transaction grows with n<sup>2</sup>.
+BIP 143 and BIP 341 compute their transaction-wide hashes once and do not have this defect.
+
+'''Signing without every input amount (CVE-2020-14199).'''
+BIP 143 commits to the amount of the input being signed, but not to the amounts of the other inputs.
+A signing device can therefore be misled about what a transaction really spends, shown a small fee, and have its signatures from two sessions combined into a valid transaction paying a much larger one.
+BIP 341 commits to every spent amount, but it is a separate algorithm, and segwit v0 inputs were never given the same commitment.
+
+One algorithm addresses both for every script type.
+Taproot needs neither fix, but using the same algorithm there leaves one message format rather than several.
+
+Changing an existing algorithm would invalidate signatures and protocols that rely on it, so this one is opt-in per signature.
+The BLAKE2b upgrade already requires every node to upgrade, which makes it a natural point to introduce it.
+
+== Specification ==
+
+=== Activation ===
+
+Let H be the BLAKE2b activation height (961640 on mainnet and 150308 on testnet4, not scheduled on other networks).
+The BLAKE2b proof-of-work change and its activation are specified in the separate draft BIP "BLAKE2b Proof of Work (Consensus layer)".
+The rules in this document apply to every transaction in a block at height H or greater, and to no transaction in a block below H.
+"The unified-sighash rules are active" below means exactly this.
+
+=== Hash type byte ===
+
+The following bits and base values are used:
+
+<pre>
+SIGHASH_ALL           0x01
+SIGHASH_NONE          0x02
+SIGHASH_SINGLE        0x03
+SIGHASH_UNIFIED       0x20
+SIGHASH_ANYONECANPAY  0x80
+</pre>
+
+A signature uses the algorithm in this document if and only if <code>SIGHASH_UNIFIED</code> is set in its hash-type byte and the unified-sighash rules are active.
+The choice is made per signature, so one script may mix opted-in and other signatures, including within one <code>OP_CHECKMULTISIG</code> or across <code>OP_CHECKSIGADD</code>.
+The entire hash-type byte is committed by the signature.
+
+For bare, P2SH, and segwit v0 inputs, the low five bits retain the legacy interpretation.
+<code>SIGHASH_SINGLE</code> signs the corresponding output, <code>SIGHASH_NONE</code> signs no outputs, and any other value signs all outputs.
+Unknown remaining bits are committed but otherwise ignored, as with the legacy algorithm.
+
+For taproot and tapscript inputs, the allowed low-bit values remain those defined by BIP 341.
+These are <code>SIGHASH_ALL</code>, <code>SIGHASH_NONE</code>, and <code>SIGHASH_SINGLE</code>, each optionally combined with <code>SIGHASH_ANYONECANPAY</code>, and with <code>SIGHASH_UNIFIED</code> set.
+Any other bit makes the signature invalid.
+<code>SIGHASH_DEFAULT</code> cannot be combined with <code>SIGHASH_UNIFIED</code>, so a 64-byte Schnorr signature never opts in and an opted-in one is always 65 bytes.
+The accepted opted-in taproot hash types are therefore exactly <code>0x21</code>, <code>0x22</code>, <code>0x23</code>, <code>0xa1</code>, <code>0xa2</code>, and <code>0xa3</code>.
+
+Before activation, <code>SIGHASH_UNIFIED</code> is not a defined consensus mode.
+For bare, P2SH, and segwit v0 spends, a signature whose hash-type byte carries bit <code>0x20</code> can still be valid before activation if it was created for the pre-existing legacy or segwit v0 message.
+It does not opt in to the unified message until the unified-sighash rules are active.
+For taproot and tapscript spends, such a signature is invalid before activation, because BIP 341 already refuses hash types it does not define.
+
+After activation, every signature whose hash-type byte carries bit <code>0x20</code> is verified under this document only.
+A bare, P2SH, or segwit v0 signature that carries the bit but was made over the pre-existing message therefore stops being valid at height H.
+
+Opting in changes only the message that is hashed.
+Signature encoding rules, the BIP 341 signature size rules, sigop counting, BIP 342 validation weight, and every other script rule are unchanged.
+
+=== Message ===
+
+Let <code>spent_outputs</code> be the outputs spent by the transaction's inputs, in input order.
+
+Define these component hashes as single SHA256 hashes over the concatenation of the listed serializations:
+
+<pre>
+sha_prevouts   = SHA256(for each input: outpoint)
+sha_amounts    = SHA256(for each spent output: amount)
+sha_scripts    = SHA256(for each spent output: scriptPubKey)
+sha_sequences  = SHA256(for each input: nSequence)
+sha_outputs    = SHA256(for each output: amount, scriptPubKey)
+</pre>
+
+These are computed over all inputs and outputs of the transaction, whatever the script types of its inputs and whether or not it has witness data.
+A verifier therefore needs every spent output of a transaction to check any opted-in signature in it, including one on a bare input.
+
+Amounts are 8-byte signed little-endian integers.
+Outpoints are serialized as 32-byte transaction identifiers followed by 4-byte little-endian output indexes.
+ScriptPubKeys are serialized as compact-size length followed by bytes.
+A serialized output is its amount followed by its scriptPubKey, both as above.
+
+The signature hash is:
+
+<pre>
+TaggedHash("UnifiedSighash", message)
+</pre>
+
+using the BIP 340 tagged-hash construction.
+The message is laid out in the same order as the BIP 341 message, so the two can be read side by side:
+
+<pre>
+1 byte    epoch, 0
+1 byte    hash type
+4 bytes   transaction version, little endian
+5 bytes   transaction locktime, little endian (4 bytes today, then one zero byte)
+
+if SIGHASH_ANYONECANPAY is not set:
+32 bytes  sha_prevouts
+32 bytes  sha_amounts
+32 bytes  sha_scripts
+32 bytes  sha_sequences
+
+if low five bits are neither SIGHASH_NONE nor SIGHASH_SINGLE:
+32 bytes  sha_outputs
+
+1 byte    script type (where BIP 341 writes its spend type)
+
+if SIGHASH_ANYONECANPAY is set:
+36 bytes  this input's outpoint
+variable  this input's spent output (amount, scriptPubKey)
+4 bytes   this input's nSequence
+else:
+4 bytes   this input's index, little endian
+
+then a script-type-specific middle (scriptCode or annex, below)
+
+if low five bits are SIGHASH_SINGLE:
+32 bytes  SHA256(serialized output at the input index)
+
+if script type is 3 (tapscript):
+32 bytes  tapleaf hash
+1 byte    key version, 0
+4 bytes   codeseparator position, little endian, or 0xffffffff if none
+</pre>
+
+The epoch byte is BIP 341's.
+It is zero and gives a later revision the same room to move that BIP 341 left itself.
+
+The hash type is committed as the single byte the signature carries, exactly as BIP 341 writes it.
+Consensus reads the hash type from the last byte of the signature, so a wider field could hold a value no verifier would ever reconstruct.
+
+The locktime is committed as five bytes rather than the four it occupies in today's transaction serialization.
+Four bytes run out on 2106-02-07, and a later protocol change widening the field would otherwise have to change this message and invalidate every signature made under it.
+The fifth byte is zero until something sets it.
+
+The script type byte is:
+
+{| class="wikitable"
+! Value
+! Meaning
+|-
+| 0 || bare or P2SH
+|-
+| 1 || segwit v0, native or nested in P2SH
+|-
+| 2 || taproot key path
+|-
+| 3 || tapscript
+|}
+
+For script types 0 and 1, the script-type-specific middle is the scriptCode serialized as a compact-size length followed by bytes.
+The scriptCode is the script the pre-existing algorithms already use, the script in which the signature opcode executes.
+That is normally the scriptPubKey for a bare input, the redeemScript for P2SH, the witnessScript for P2WSH, and for P2WPKH the implied P2PKH script as in BIP 143.
+It runs from just after the most recently executed <code>OP_CODESEPARATOR</code>, or from the start of the executing script if none has executed, to the end of that script.
+For script type 1 this is the BIP 143 scriptCode.
+For script type 0, the signature arguments of the executing opcode are then removed from it with the legacy procedure.
+It deletes, at opcode boundaries, each occurrence of the signature encoded as a single data push, which is <code>OP_0</code> for an empty signature and otherwise the shortest direct push or <code>OP_PUSHDATA</code> that fits its length.
+That is one signature for <code>OP_CHECKSIG</code> and <code>OP_CHECKSIGVERIFY</code>, and all of them for <code>OP_CHECKMULTISIG</code> and <code>OP_CHECKMULTISIGVERIFY</code>, removed before any of them is checked.
+Unlike the legacy serialization, any <code>OP_CODESEPARATOR</code> opcodes left in the scriptCode are not removed, so the scriptCode is committed byte for byte.
+
+For script types 2 and 3, the middle is instead:
+
+<pre>
+1 byte    1 if an annex is present, otherwise 0
+32 bytes  SHA256(compact-size length of the annex || annex), if an annex is present
+</pre>
+
+The annex is the one BIP 341 defines, including its leading <code>0x50</code> byte, and is hashed exactly as BIP 341 hashes it.
+
+The tapleaf hash and the codeseparator position are those BIP 342 defines.
+
+=== SIGHASH_SINGLE without a matching output ===
+
+If the low five bits are <code>SIGHASH_SINGLE</code> and the input index is not less than the number of outputs, the message is undefined, and the legacy substitute value of 1 is never used.
+For script types 0 and 1 the signature check then evaluates to false, exactly as for any other signature that does not verify, and script execution continues.
+For script types 2 and 3 the script fails, as BIP 341 requires for a hash type it refuses.
+
+=== Differences from the pre-existing algorithms ===
+
+These apply only to signatures that opt in.
+
+* <code>SIGHASH_SINGLE</code> without a matching output never yields a signable message, as described above.
+* The script type byte separates the four script types, so a signature made for one is never valid for another.
+* For script type 0 the scriptCode is committed byte for byte. <code>OP_CODESEPARATOR</code> opcodes left in it are not stripped as the original algorithm strips them.
+* When <code>SIGHASH_ANYONECANPAY</code> is not set, <code>SIGHASH_NONE</code> and <code>SIGHASH_SINGLE</code> still commit to every input's nSequence through <code>sha_sequences</code>, as BIP 341 does. The original algorithm zeroes the other inputs' sequence numbers and BIP 143 omits them, so a protocol that relies on a counterparty changing nSequence under those types does not carry over.
+* Under <code>SIGHASH_ANYONECANPAY</code> the input's position is not committed, so the input can still be moved into another transaction, and its own outpoint, spent output, and nSequence are committed directly. <code>SIGHASH_SINGLE|SIGHASH_ANYONECANPAY</code> therefore binds the input to the output at its own index without binding either to a position. The original algorithm binds the position for script type 0 as a side effect of how it serializes outputs. BIP 341 does not, and neither does this.
+
+=== Signing ===
+
+The message commits to the amount and scriptPubKey of every spent output, for every script type and unless <code>SIGHASH_ANYONECANPAY</code> is set.
+A signer therefore needs every input's spent output, including for bare and P2SH inputs, which have never needed amounts before.
+PSBT already carries them per input.
+How PSBT fields record the hash type is outside the scope of this document.
+
+Implementing the message does not require implementing BIP 341.
+Signatures over it are made and verified exactly as they are today for the script type in question, so script types 0 and 1 use ECDSA as before, with no Schnorr signatures, x-only keys, or key tweaking.
+Compared with BIP 143, a signer for those types needs the aggregate hashes with a single SHA256 rather than a double one, the two aggregates over every spent amount and scriptPubKey, and the BIP 340 tagged hash.
+
+== Deployment ==
+
+The consensus rules take effect at height H as specified above.
+
+The deployment is scheduled on a network when that network's parameters specify an activation height.
+Relay policy is keyed on the deployment being scheduled, not on the height having been reached.
+As soon as it is scheduled, the mempool accepts opted-in signatures under this algorithm and refuses legacy signatures whose hash type carries the bit without opting in.
+Relay accepts opted-in ECDSA signatures only with hash types <code>0x21</code>, <code>0x22</code>, <code>0x23</code>, <code>0xa1</code>, <code>0xa2</code>, and <code>0xa3</code>.
+The other bytes are valid at consensus but not relayed.
+On a network where the deployment is not scheduled, relay refuses any ECDSA signature whose hash type carries the bit.
+
+Because relay accepts opted-in signatures as soon as the deployment is scheduled, a node below the activation height can hold transactions in its mempool that the next block cannot include.
+This is the normal state between scheduling and height H, and also follows a reorganization back below the height.
+Unlike other script rules, this one makes some signatures valid and others invalid, so passing relay policy does not imply validity in the next block below H.
+Implementations should refuse a block template request in that state explicitly rather than fail on assembly.
+
+''Note, not normative.'' The reference implementation does not yet refuse explicitly, and fails template assembly instead while it holds such a transaction below the height.
+
+== Rationale ==
+
+'''Why is the new algorithm opt-in?'''
+
+The algorithm remains opt-in because old signatures and old protocols may rely on the historical behavior of <code>SIGHASH_NONE</code>, <code>SIGHASH_SINGLE</code>, and <code>SIGHASH_ANYONECANPAY</code>.
+Keeping the old algorithms available avoids unnecessarily invalidating those protocols.
+
+'''Why commit to the script type and every spent output?'''
+
+The explicit script type byte keeps a signature made for one script type from being valid for another with an otherwise identical message.
+Committing to every spent output brings pre-taproot signing up to the data-commitment level expected by BIP 341 and removes the signing oracle ambiguity described by CVE-2020-14199 for opted-in inputs.
+The aggregate hashes are computed once per transaction, so hashing for an opted-in signature costs a fixed amount plus its scriptCode rather than the whole transaction, which removes the quadratic cost of CVE-2013-2292 for that signature.
+It does not bound worst-case validation cost, since a transaction that does not opt in still hashes quadratically.
+
+'''Why the tag "UnifiedSighash"?'''
+
+It names the algorithm, following BIP 341's <code>"TapSighash"</code>, and keeps this message distinct from every other BIP 340 tagged hash.
+It cannot change after deployment without invalidating every signature made under it.
+
+'''Why one algorithm for every script type, including taproot?'''
+
+A single message format is one thing to specify, implement, test, and review, and one place for a future defect to be fixed.
+The cost is that a BIP 341 signer cannot opt in by setting a bit, and has to implement this message.
+Taproot keeps the parts of its message that carry meaning the others do not, the annex, the tapleaf hash, and the codeseparator position.
+Opted-in taproot signatures give up <code>SIGHASH_DEFAULT</code> and its one-byte saving, since the bit needs a byte to live in.
+
+'''Why activate at the BLAKE2b height rather than an offset from it?'''
+
+Activating both at one height leaves no window in which blocks are mined under the new proof of work while opting in is unavailable.
+
+'''What does a node without these rules do with an opted-in signature?'''
+
+It computes a pre-existing message for the same byte, so the signature does not verify there.
+A signature without the bit is valid under both rule sets.
+
+== Backward compatibility ==
+
+This rule change is not backward compatible.
+Upgraded nodes accept signatures with <code>SIGHASH_UNIFIED</code> after activation if they verify under this document.
+Nodes that do not implement it do not share the same post-activation consensus rules.
+
+It also tightens an existing rule.
+A pre-signed transaction with a bare, P2SH, or segwit v0 signature whose hash type carries bit <code>0x20</code>, made over the pre-existing message, cannot be included in a block at or after height H.
+Such signatures are non-standard.
+A scan of every mainnet block below height 961640 finds 17 confirmed signatures carrying the bit, six with hash type <code>0x21</code> and eleven with <code>0x65</code>, all between heights 505057 and 509793 in early 2018 and none since.
+A transaction signed this way and held unbroadcast cannot be counted from the chain.
+Where the key still exists, signing again without the bit is always possible.
+If the key was destroyed after signing, as with some pre-signed refund or inheritance arrangements, the output cannot be spent.
+Taproot is unaffected, since BIP 341 already makes undefined hash types invalid.
+
+== Test vectors ==
+
+The immutable reference vectors are in [https://github.com/bitcoinknots/bitcoin/blob/8c85b1585dac23f964e2dd32045624de7f02aa58/src/test/data/unified_sighash.json the v29.4.1.knots20260508 test-vector file].
+The file is a JSON array whose first element is a header row.
+Each further record specifies the <code>scriptCode</code>, raw transaction, input index, hash type, script type, spent outputs, and expected signature hash.
+
+* The <code>scriptCode</code> is hashed as given. For script types 0 and 1 it is the final committed scriptCode, so codeseparator truncation and signature removal must not be applied to it again.
+* The raw transaction is the serialization without witness data.
+* The input index and hash type are integers, and the hash type is the full byte including <code>SIGHASH_UNIFIED</code>.
+* The script type is a value from this document's script-type table.
+* Spent outputs are <code>[amount, scriptPubKey hex]</code> pairs in input order.
+* The expected signature hash is the raw 32-byte tagged-hash output in hex, not byte-reversed.
+* No vector has an annex.
+* For script type 2 the <code>scriptCode</code> field is unused.
+* For script type 3 the tapleaf hash is computed over the <code>scriptCode</code> field with leaf version <code>0xc0</code>, and the codeseparator position is <code>0xffffffff</code>.
+
+The reference vectors contain no <code>OP_CODESEPARATOR</code> in a scriptCode, no annex, no other codeseparator position, and no case that must fail.
+[[bip-unified-sighash/unified_sighash_supplementary.json|Supplementary vectors]] cover those.
+Each of their records adds a note first and an annex (hex or null) and a codeseparator position before the expected hash, and an expected hash of null means the message is undefined and the signature cannot be valid.
+
+Implementations MUST reproduce each expected hash for the specified input data, and MUST refuse every record whose expected hash is null.
+
+== Reference implementation ==
+
+The reference implementation is Bitcoin Knots tag [https://github.com/bitcoinknots/bitcoin/commit/8c85b1585dac23f964e2dd32045624de7f02aa58 v29.4.1.knots20260508], principally <code>src/script/interpreter.cpp</code>, <code>src/script/interpreter.h</code>, <code>src/validation.cpp</code>, <code>src/test/sighash_tests.cpp</code>, and <code>src/test/data/unified_sighash.json</code>.
+The unified signature hash code in these files is unchanged through v29.5.knots20260508.
+
+== Acknowledgments ==
+
+Thank you to Luke Dashjr for the inspiration for this proposal and for his advice throughout its design.
